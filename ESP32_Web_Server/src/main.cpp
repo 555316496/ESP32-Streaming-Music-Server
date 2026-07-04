@@ -3,6 +3,7 @@
 #include <SD.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <ESPmDNS.h>
@@ -23,7 +24,7 @@
 #define MAX_NAME_LEN      60
 #define MAX_EXT_LEN       8
 #define API_BUF_SIZE      8192
-#define MAX_TRANSMISSION_CAPACITY 20
+#define MAX_TRANSMISSION_CAPACITY 30
 
 // 播放列表与最近播放
 #define MAX_PLAYLIST_NUM     5
@@ -35,7 +36,7 @@
 #define TYPE_MUSIC    1
 
 // WiFi 配置
-#define AP_SSID           "ESP32-Media-Setup"
+#define AP_SSID           "ESP32-Streaming-WebServer"
 #define AP_PASSWORD       "12345678"
 #define WIFI_RETRY_MAX    1
 
@@ -49,6 +50,7 @@
 
 // Preferences 命名空间
 #define PREFS_NAMESPACE   "esp32media"
+#define DEVICE_NAME       "ESP32-Streaming-WebServer"
 
 
 
@@ -87,6 +89,7 @@ const int   Music_Ext_Num = 6;
 const char* Music_MIME[] = {"audio/mpeg","audio/wav","audio/flac","audio/aac","audio/ogg","audio/mp4"};
 
 AsyncWebServer Streaming_WebServer(80);
+DNSServer g_dnsServer;
 Preferences g_prefs;
 
 char g_wifiSSID[33] = {0};
@@ -95,6 +98,7 @@ bool g_wifiConnected = false;
 
 bool SerialDebugEnabled = true;
 int g_wifiPower = WIFI_POWER_11dBm;
+char g_mdnsHostname[32] = MDNS_HOSTNAME;
 
 // 播放列表
 Playlist g_playlists[MAX_PLAYLIST_NUM];
@@ -105,7 +109,7 @@ int g_recentSongs[MAX_RECENT_SONGS];
 int g_recentCount = 0;
 
 // 主题
-char g_theme[32] = "blue";
+char g_theme[32] = "lime";
 
 
 
@@ -123,7 +127,7 @@ const char* Get_MIME_Type(uint8_t type, const char* ext);
 void Playlist_Load();
 void Playlist_Save();
 
-// 最近播放
+// 最近播放已改为浏览器本地 sessionStorage，不再写入 ESP32。
 void Recent_Add(int index);
 
 // Web API
@@ -435,33 +439,9 @@ void Playlist_Save() {
 
 /*********************** 最近播放 ************************/
 void Recent_Add(int index) {
-  // 越界检查
-  if (index < 0 || index >= g_mediaLib.MusicCount) return;
-
-  // 移除已存在的相同记录
-  for (int i = 0; i < g_recentCount; i++) {
-    if (g_recentSongs[i] == index) {
-      for (int j = i; j < g_recentCount - 1; j++) {
-        g_recentSongs[j] = g_recentSongs[j + 1];
-      }
-      g_recentCount--;
-      break;
-    }
-  }
-
-  // 插入到最前面
-  if (g_recentCount >= MAX_RECENT_SONGS) {
-    for (int i = MAX_RECENT_SONGS - 1; i > 0; i--) {
-      g_recentSongs[i] = g_recentSongs[i - 1];
-    }
-    g_recentSongs[0] = index;
-  } else {
-    for (int i = g_recentCount; i > 0; i--) {
-      g_recentSongs[i] = g_recentSongs[i - 1];
-    }
-    g_recentSongs[0] = index;
-    g_recentCount++;
-  }
+  // 最近播放不再由 ESP32 保存，避免多设备串数据，也避免无意义写入 Flash。
+  // 保留空实现只为兼容旧版前端调用。
+  (void)index;
 }
 
 
@@ -606,6 +586,10 @@ const char* WebAPI_GetPlaylists() {
     pl["name"] = g_playlists[i].name;
     pl["song_count"] = g_playlists[i].songCount;
     pl["count"] = g_playlists[i].songCount;
+    JsonArray songIdx = pl["song_indices"].to<JsonArray>();
+    for (int j = 0; j < g_playlists[i].songCount; j++) {
+      songIdx.add(g_playlists[i].songs[j]);
+    }
   }
 
   doc["total"] = g_playlistCount;
@@ -650,26 +634,12 @@ const char* WebAPI_GetPlaylistSongs(int plIndex) {
 
 
 const char* WebAPI_GetRecent() {
+  // 最近播放完全交给访问设备本地缓存，ESP32 永远返回空列表。
   JsonDocument doc;
   doc["status"] = "ok";
-
-  JsonArray data = doc["recent"].to<JsonArray>();
-
-  for (int i = 0; i < g_recentCount; i++) {
-    int songIdx = g_recentSongs[i];
-    if (songIdx < 0 || songIdx >= g_mediaLib.MusicCount) continue;
-
-    FileInfo* info = &g_mediaLib.MusicList[songIdx];
-    JsonObject song = data.add<JsonObject>();
-    song["index"] = songIdx;
-    song["name"] = info->name;
-    song["path"] = info->path;
-    song["size"] = info->size;
-    song["size_kb"] = info->size / 1024;
-    song["ext"] = info->extention;
-  }
-
-  doc["count"] = data.size();
+  doc["local_only"] = true;
+  doc["recent"].to<JsonArray>();
+  doc["count"] = 0;
   serializeJson(doc, g_apiBuffer, API_BUF_SIZE);
   return g_apiBuffer;
 }
@@ -693,7 +663,103 @@ void WebAPI_StreamMusic(int index, AsyncWebServerRequest* request) {
   }
 
   const char* mimeType = Get_MIME_Type(TYPE_MUSIC, info->extention);
-  AsyncWebServerResponse* response = new AsyncFileResponse(SD, path, mimeType, false);
+  uint32_t fileSize = info->size;
+  if (fileSize == 0) {
+    File sizeFile = SD.open(path, FILE_READ);
+    if (!sizeFile) {
+      request->send(500, "text/plain", "File open failed");
+      return;
+    }
+    fileSize = sizeFile.size();
+    sizeFile.close();
+  }
+
+  uint32_t rangeStart = 0;
+  uint32_t rangeEnd = fileSize > 0 ? fileSize - 1 : 0;
+  bool isRangeRequest = false;
+
+  if (request->hasHeader("Range") || request->hasHeader("range")) {
+    String rangeHeader = request->hasHeader("Range")
+      ? request->getHeader("Range")->value()
+      : request->getHeader("range")->value();
+    rangeHeader.trim();
+
+    if (rangeHeader.startsWith("bytes=") && fileSize > 0) {
+      String rangeValue = rangeHeader.substring(6);
+      int dashPos = rangeValue.indexOf('-');
+
+      if (dashPos >= 0) {
+        String startText = rangeValue.substring(0, dashPos);
+        String endText = rangeValue.substring(dashPos + 1);
+        startText.trim();
+        endText.trim();
+
+        if (startText.length() > 0) {
+          rangeStart = (uint32_t)strtoul(startText.c_str(), nullptr, 10);
+          rangeEnd = endText.length() > 0 ? (uint32_t)strtoul(endText.c_str(), nullptr, 10) : fileSize - 1;
+        } else if (endText.length() > 0) {
+          uint32_t suffixLen = (uint32_t)strtoul(endText.c_str(), nullptr, 10);
+          if (suffixLen > fileSize) suffixLen = fileSize;
+          rangeStart = fileSize - suffixLen;
+          rangeEnd = fileSize - 1;
+        }
+
+        if (rangeStart < fileSize) {
+          if (rangeEnd >= fileSize) rangeEnd = fileSize - 1;
+          if (rangeEnd >= rangeStart) {
+            isRangeRequest = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (fileSize == 0 || rangeStart >= fileSize || rangeEnd < rangeStart) {
+    AsyncWebServerResponse* response = request->beginResponse(416, "text/plain", "Requested Range Not Satisfiable");
+    char contentRange[48];
+    snprintf(contentRange, sizeof(contentRange), "bytes */%lu", (unsigned long)fileSize);
+    response->addHeader("Content-Range", contentRange);
+    response->addHeader("Accept-Ranges", "bytes");
+    request->send(response);
+    return;
+  }
+
+  File streamFile = SD.open(path, FILE_READ);
+  if (!streamFile) {
+    request->send(500, "text/plain", "File open failed");
+    return;
+  }
+  streamFile.seek(rangeStart);
+
+  const size_t contentLength = (size_t)(rangeEnd - rangeStart + 1);
+  AsyncWebServerResponse* response = request->beginResponse(mimeType, contentLength,
+    [streamFile, contentLength](uint8_t* buffer, size_t maxLen, size_t index) mutable -> size_t {
+      if (!streamFile || index >= contentLength) {
+        if (streamFile) streamFile.close();
+        return 0;
+      }
+
+      size_t remain = contentLength - index;
+      size_t toRead = remain < maxLen ? remain : maxLen;
+      size_t readLen = streamFile.read(buffer, toRead);
+
+      if (index + readLen >= contentLength) {
+        streamFile.close();
+      }
+      return readLen;
+    }
+  );
+
+  if (isRangeRequest) {
+    response->setCode(206);
+    char contentRange[80];
+    snprintf(contentRange, sizeof(contentRange), "bytes %lu-%lu/%lu",
+             (unsigned long)rangeStart, (unsigned long)rangeEnd, (unsigned long)fileSize);
+    response->addHeader("Content-Range", contentRange);
+  }
+
+  response->addHeader("Accept-Ranges", "bytes");
+  response->addHeader("Cache-Control", "public, max-age=3600, no-transform");
   request->send(response);
 }
 
@@ -714,11 +780,8 @@ void WiFi_LoadSettings() {
   SerialDebugEnabled = g_prefs.getBool("debug_en", true);
   g_wifiPower = g_prefs.getInt("wifi_power", WIFI_POWER_11dBm);
 
-  // 加载主题
-  if (g_prefs.isKey("theme")) {
-    String theme = g_prefs.getString("theme", "blue");
-    Secure_String_Copying(g_theme, theme.c_str(), sizeof(g_theme));
-  }
+  // 主题由各访问设备在浏览器本地保存，ESP32 只提供默认青柠之夏。
+  Secure_String_Copying(g_theme, "lime", sizeof(g_theme));
 
   g_prefs.end();
 }
@@ -732,7 +795,6 @@ void WiFi_SaveSettings() {
   g_prefs.putString("wifi_pass", g_wifiPassword);
   g_prefs.putBool("debug_en", SerialDebugEnabled);
   g_prefs.putInt("wifi_power", g_wifiPower);
-  g_prefs.putString("theme", g_theme);
   g_prefs.end();
 }
 
@@ -756,6 +818,7 @@ bool WiFi_Connect(const char* ssid, const char* password) {
   Serial.println("正在连接...");
 
   WiFi.mode(WIFI_STA);
+  g_dnsServer.stop();
   WiFi.setTxPower((wifi_power_t)g_wifiPower);
   WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.begin(ssid, password);
@@ -792,6 +855,7 @@ void WiFi_StartAP() {
   delay(500);
 
   WiFi.mode(WIFI_AP);
+  WiFi.setHostname(MDNS_HOSTNAME);
   WiFi.setTxPower((wifi_power_t)g_wifiPower);
 
   if (!WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY_IP, AP_SUBNET_MASK)) {
@@ -805,6 +869,7 @@ void WiFi_StartAP() {
   }
 
   IPAddress apIP = WiFi.softAPIP();
+  g_dnsServer.start(53, "*", apIP);
   Serial.println("√ AP已启动");
   Serial.print("  SSID: "); Serial.println(AP_SSID);
   Serial.print("  密码: "); Serial.println(AP_PASSWORD);
@@ -816,6 +881,9 @@ void WiFi_StartAP() {
 
 /*********************** mDNS启动 ************************/
 void WiFi_Init_MDNS() {
+  MDNS.end();
+  delay(100);
+
   String hostnames[6];
   hostnames[0] = String(MDNS_HOSTNAME);
   hostnames[1] = String(MDNS_HOSTNAME) + "1";
@@ -828,6 +896,7 @@ void WiFi_Init_MDNS() {
     const char* tryHost = hostnames[i].c_str();
 
     if (MDNS.begin(tryHost)) {
+      Secure_String_Copying(g_mdnsHostname, tryHost, sizeof(g_mdnsHostname));
       Serial.print("》mDNS已启动: http://");
       Serial.print(tryHost);
       Serial.println(".local");
@@ -838,10 +907,10 @@ void WiFi_Init_MDNS() {
         debug_println(")");
       }
 
-      MDNS.addService("_http", "_tcp", 80);
-      MDNS.addService("_esp32streaming", "_tcp", 80);
-      MDNS.addServiceTxt("_http", "_tcp", "path", "/");
-      MDNS.addServiceTxt("_http", "_tcp", "name", "ESP32Streaming Music Server");
+      MDNS.addService("http", "tcp", 80);
+      MDNS.addService("esp32streaming", "tcp", 80);
+      MDNS.addServiceTxt("http", "tcp", "path", "/");
+      MDNS.addServiceTxt("http", "tcp", "name", DEVICE_NAME);
       return;
     }
 
@@ -850,6 +919,7 @@ void WiFi_Init_MDNS() {
   }
 
   Serial.println("》mDNS启动失败");
+  Secure_String_Copying(g_mdnsHostname, MDNS_HOSTNAME, sizeof(g_mdnsHostname));
 }
 
 
@@ -1061,21 +1131,13 @@ void WebServer_SetupRoutes() {
     request->send(200, "application/json", WebAPI_GetRecent());
   });
 
-  // 13. 添加最近播放记录
+  // 13. 最近播放只存在浏览器本地，这两个接口保留为空操作以兼容旧 UI。
   Streaming_WebServer.on("/api/recent/add", HTTP_POST, [](AsyncWebServerRequest* request) {
-    if (!request->hasParam("index")) {
-      request->send(400, "application/json", "{\"status\":\"error\",\"msg\":\"missing index\"}");
-      return;
-    }
-    int index = request->getParam("index")->value().toInt();
-    Recent_Add(index);
-    request->send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"added to recent\"}");
+    request->send(200, "application/json", "{\"status\":\"ok\",\"local_only\":true}");
   });
 
-  // 13b. 清空最近播放
   Streaming_WebServer.on("/api/recent/clear", HTTP_POST, [](AsyncWebServerRequest* request) {
-    g_recentCount = 0;
-    request->send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"recent cleared\"}");
+    request->send(200, "application/json", "{\"status\":\"ok\",\"local_only\":true}");
   });
 
   // 14. 获取主题
@@ -1164,10 +1226,10 @@ void WebServer_SetupRoutes() {
 
     if (g_wifiConnected) {
       doc["ip"] = WiFi.localIP().toString();
-      doc["hostname"] = "ESP32Streaming";
+      doc["hostname"] = String(g_mdnsHostname) + ".local";
     } else {
       doc["ip"] = WiFi.softAPIP().toString();
-      doc["hostname"] = "ESP32Streaming";
+      doc["hostname"] = String(g_mdnsHostname) + ".local";
     }
 
     serializeJson(doc, g_apiBuffer, API_BUF_SIZE);
@@ -1178,7 +1240,8 @@ void WebServer_SetupRoutes() {
   Streaming_WebServer.on("/api/device", HTTP_GET, [](AsyncWebServerRequest* request) {
     JsonDocument doc;
     doc["status"] = "ok";
-    doc["name"] = "ESP32Streaming";
+    doc["name"] = DEVICE_NAME;
+    doc["hostname"] = String(g_mdnsHostname) + ".local";
     if (g_wifiConnected) {
       doc["ip"] = WiFi.localIP().toString();
     } else {
@@ -1201,6 +1264,11 @@ void WebServer_SetupRoutes() {
   // 23. 主页 UI
   // 使用 beginResponse 直接从 Flash 流式发送，避免把 84KB 的 UI 一次性复制到 RAM。
   Streaming_WebServer.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (SerialDebugEnabled && request && request->client()) {
+      Serial.print("[WiFi事件] IP: ");
+      Serial.print(request->client()->remoteIP());
+      Serial.println(" 登录Web");
+    }
     AsyncWebServerResponse* response = request->beginResponse(
       200, "text/html; charset=utf-8",
       (const uint8_t*)UI_HTML, strlen(UI_HTML)
@@ -1319,18 +1387,12 @@ void Handle_SetWiFiPower(AsyncWebServerRequest* request) {
 
 
 void Handle_SetTheme(AsyncWebServerRequest* request) {
-  String theme = request->hasParam("theme") ? request->getParam("theme")->value() : "blue";
-
-  Secure_String_Copying(g_theme, theme.c_str(), sizeof(g_theme));
-
-  // 保存到 Preferences
-  g_prefs.begin(PREFS_NAMESPACE, false);
-  g_prefs.putString("theme", g_theme);
-  g_prefs.end();
-
+  // 主题选择不再写入 ESP32；每台设备在浏览器本地保存自己的主题。
+  String theme = request->hasParam("theme") ? request->getParam("theme")->value() : "lime";
   JsonDocument resp;
   resp["status"] = "ok";
-  resp["theme"] = g_theme;
+  resp["theme"] = theme;
+  resp["local_only"] = true;
   serializeJson(resp, g_apiBuffer, API_BUF_SIZE);
   request->send(200, "application/json", g_apiBuffer);
 }
@@ -1345,7 +1407,7 @@ void setup() {
   delay(500);
 
   Serial.println("\n========================================");
-  Serial.println("  ESP32Streaming 音乐服务器");
+  Serial.println("  ESP32-Streaming-WebServer 音乐服务器");
   Serial.println("========================================");
 
   // 注册WiFi事件
@@ -1394,11 +1456,17 @@ void setup() {
     Serial.print("密码: "); Serial.println(AP_PASSWORD);
     Serial.print("访问: http://"); Serial.println(WiFi.softAPIP().toString());
   }
-  Serial.println("或: http://esp32streaming.local");
+  Serial.print("或: http://"); Serial.print(g_mdnsHostname); Serial.println(".local");
 }
 
 
 void loop() {
-  // 异步服务器，无需处理HTTP请求
-  delay(1000);
+  // AP 配网模式需要处理 DNS 劫持请求，延时不能太长
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    g_dnsServer.processNextRequest();
+    delay(50);
+  } else {
+    // STA 正常联网模式下，异步 WebServer 不需要在 loop 里处理 HTTP
+    delay(1000);
+  }
 }
